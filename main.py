@@ -1,11 +1,11 @@
 import os
-import re
 import random
 import asyncio
 import logging
+import datetime
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError, AuthKeyUnregisteredError
+from telethon.errors import FloodWaitError, ChatWriteForbiddenError, AuthKeyUnregisteredError, UserDeactivatedError, SessionRevokedError
 
 # ================= 1. 日志配置 =================
 logging.basicConfig(
@@ -29,18 +29,27 @@ if not all([API_ID, API_HASH, session_strings, TARGET_CHAT_ID, CONTROLLER_SESSIO
     logger.error("❌ 环境变量缺失！请检查相关配置")
     exit(1)
 
-# ================= 3. 全局状态与并发锁 =================
-used_numbers = set()         # 记录全局已出现的号码（群友的 + 自己发的）
-number_lock = asyncio.Lock() # 核心：防止两个号同时抽到同一个号
-is_sending = False           # 发送开关
-total_sent = 0               # 自己发出去的总条数（上限40）
-MAX_SEND_COUNT = 40          # 最多发送40条（两个号各20条）
+# ================= 3. 全局状态 =================
+my_sent_numbers = set()      # 记录自己发过的号码
+number_lock = asyncio.Lock() # 并发锁
+is_sending = False           # 全局开关（任何一个账号存活都会继续）
 spam_tasks = []
 
-# ================= 4. 初始化客户端 =================
+# ================= 4. 初始化客户端（扩充设备库） =================
+# 扩充了12个设备，确保你即使挂5个号也不会设备指纹冲突
 DEVICES = [
     {"device_model": "Samsung Galaxy S23", "system_version": "Android 13", "app_version": "10.2.1"},
     {"device_model": "iPhone 14 Pro", "system_version": "iOS 16.5", "app_version": "10.1.0"},
+    {"device_model": "Xiaomi 13", "system_version": "Android 13", "app_version": "9.6.2"},
+    {"device_model": "PC", "system_version": "Windows 11", "app_version": "4.8.1"},
+    {"device_model": "MacBook Pro", "system_version": "macOS 13.4", "app_version": "4.9.0"},
+    {"device_model": "OnePlus 11", "system_version": "Android 13", "app_version": "10.0.4"},
+    {"device_model": "Google Pixel 7", "system_version": "Android 13", "app_version": "10.2.0"},
+    {"device_model": "Redmi Note 12", "system_version": "Android 12", "app_version": "9.5.1"},
+    {"device_model": "iPad Pro", "system_version": "iOS 16.4", "app_version": "10.0.2"},
+    {"device_model": "Huawei P60", "system_version": "HarmonyOS 3.1", "app_version": "9.6.1"},
+    {"device_model": "Oppo Find X6", "system_version": "Android 13", "app_version": "9.7.0"},
+    {"device_model": "Vivo X90", "system_version": "Android 13", "app_version": "9.6.5"}
 ]
 
 clients = []
@@ -53,9 +62,9 @@ controller_client = TelegramClient(
     device_model="Telegram Desktop", system_version="Linux", app_version="4.8.1"
 )
 
-# ================= 5. 动态随机发送工作线程 =================
+# ================= 5. 发送工作线程 =================
 async def spam_worker(client, worker_id):
-    global is_sending, total_sent
+    global is_sending
     
     try:
         me = await client.get_me()
@@ -64,59 +73,72 @@ async def spam_worker(client, worker_id):
         client_name = f"账号{worker_id}"
 
     while is_sending:
-        async with number_lock: # 加锁，确保此刻只有这一个号在生成随机数
-            if total_sent >= MAX_SEND_COUNT:
-                logger.info(f"✅ [{client_name}] 已达最大发送数量（{MAX_SEND_COUNT}条），准备停止。")
-                is_sending = False # 触发全局停止
+        # --- 1. 时间检查 (基于 UTC+8) ---
+        now_utc8 = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+        if now_utc8.hour > 22 or (now_utc8.hour == 22 and now_utc8.minute >= 10):
+            logger.info(f"⏰ [{client_name}] 时间已到 22:10，自动停止发送。")
+            is_sending = False
+            break
+
+        async with number_lock:
+            # --- 2. 检查号码是否发完，发完即止 ---
+            if len(my_sent_numbers) >= 216:
+                logger.info("🎉 216个不重复号码已全部发送完毕，系统自动停止。")
+                is_sending = False
                 break
             
-            # 动态生成 1-6 的随机三位数
-            max_retries = 30
+            # --- 3. 动态生成随机号码 ---
+            max_retries = 50
             rand_num = None
             for _ in range(max_retries):
-                # 每次即时生成，不预存
                 temp_num = f"{random.randint(1, 6)}{random.randint(1, 6)}{random.randint(1, 6)}"
-                
-                # 双重去重：不能和群友重复，也不能和自己重复
-                if temp_num not in used_numbers:
+                if temp_num not in my_sent_numbers:
                     rand_num = temp_num
-                    used_numbers.add(rand_num) # 立刻登记，防止另一个号马上抢走
-                    total_sent += 1
+                    my_sent_numbers.add(rand_num)
                     break
                     
             if rand_num is None:
-                logger.warning(f"⚠️ [{client_name}] 连续 {max_retries} 次抽取都撞号，等待 0.5 秒重试...")
-                await asyncio.sleep(0.5)
+                logger.warning(f"⚠️ [{client_name}] 抽取异常，跳过此轮。")
                 continue
 
-        # ---- 释放锁之后再进行网络发送，避免阻塞另一个号抽号 ----
+        # --- 4. 发送消息 ---
         content = f"八号担保，全网收购新币公群-{rand_num}"
         try:
             await client.send_message(TARGET_CHAT_ID, content)
-            logger.info(f"🚀 [{client_name}] 发送成功: {rand_num} (自己进度: {total_sent}/{MAX_SEND_COUNT})")
+            logger.info(f"🚀 [{client_name}] 发送成功: {rand_num} (进度: {len(my_sent_numbers)}/216)")
+            
+            # 350ms 间隔
+            await asyncio.sleep(0.35)
+            
+        # --- 5. 异常处理（核心改动：区分风控与账号死亡） ---
+        except ChatWriteForbiddenError:
+            # 群组被禁言，所有账号都会发不出去，直接全局停止
+            logger.error(f"❌ [{client_name}] 群组被禁言或账号无权限，全局停止！")
+            is_sending = False
+            break
+        except (AuthKeyUnregisteredError, UserDeactivatedError, SessionRevokedError) as e:
+            # 【关键】某个账号彻底死掉（被封禁/被注销），该账号任务退出，不影响其他账号
+            logger.error(f"💀 [{client_name}] 账号已失效或被封禁 ({type(e).__name__})，该账号退出，剩余账号继续发送。")
+            return # 仅退出当前worker，不修改is_sending
         except FloodWaitError as e:
+            # 触发限制，该账号休息等待，其他账号继续
             logger.warning(f"⚠️ [{client_name}] 触发限制，等待 {e.seconds} 秒...")
             await asyncio.sleep(e.seconds)
         except Exception as e:
             logger.error(f"❌ [{client_name}] 发送失败: {e}")
             await asyncio.sleep(1)
-        
-        # 500ms 间隔
-        await asyncio.sleep(0.5)
 
 # ================= 6. 主程序逻辑 =================
 async def main():
-    global is_sending, spam_tasks, used_numbers, total_sent
+    global is_sending, spam_tasks, my_sent_numbers
 
-    # 启动打手
     for i, client in enumerate(clients):
         try:
             await client.start()
             logger.info(f"✅ 打手账号 {i+1} 启动成功")
         except Exception as e:
-            logger.error(f"❌ 打手账号 {i+1} 启动失败: {e}")
+            logger.error(f"❌ 打手账号 {i+1} 启动失败 (可能已死): {e}")
 
-    # 启动控制账号
     try:
         await controller_client.start()
         logger.info("👑 独立控制账号启动成功，正在监听群组指令...")
@@ -126,37 +148,24 @@ async def main():
 
     @controller_client.on(events.NewMessage(chats=TARGET_CHAT_ID))
     async def handler(event):
-        global is_sending, spam_tasks, used_numbers, total_sent
+        global is_sending, spam_tasks, my_sent_numbers
         text = event.text.strip() if event.text else ""
-        sender_id = event.sender_id
 
-        # ---- 实时监控群友的号码，动态加入黑名单 ----
-        if sender_id != ADMIN_ID:
-            match = re.search(r"八号担保，全网收购新币公群-([1-6]{3})", text)
-            if match:
-                num = match.group(1)
-                async with number_lock:
-                    if num not in used_numbers:
-                        used_numbers.add(num)
-                        logger.info(f"📥 监控到群内新号码: {num} (已自动排除)")
+        if event.sender_id != ADMIN_ID:
             return
 
-        # ---- 管理员指令区 ----
         if text == "1":
             if is_sending:
                 logger.info("⏳ 已经在发送中...")
                 return
             
-            logger.info("🔥 收到指令 '1'，动态随机轰炸模式启动！")
+            logger.info(f"🔥 收到指令 '1'，启动 {len(clients)} 个账号并发轰炸！(350ms/条)")
+            my_sent_numbers.clear()
             is_sending = True
-            total_sent = 0 # 重置计数器
             
-            # 启动2个打手任务并发消费
-            for i in range(len(clients)):
-                task = asyncio.create_task(spam_worker(clients[i], i+1))
+            for i, client in enumerate(clients):
+                task = asyncio.create_task(spam_worker(client, i+1))
                 spam_tasks.append(task)
-            
-            logger.info("🚀 已启动 2 个并发线程，目标 40 条，每条间隔 500ms。")
 
         elif text == "2":
             logger.info("🛑 收到指令 '2'，强行停止发送...")
