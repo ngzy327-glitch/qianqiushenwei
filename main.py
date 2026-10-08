@@ -44,7 +44,6 @@ logger.info(f"✅ 配置校验通过，共加载 {len(session_strings)} 个打�
 logger.info("👑 正在初始化独立控制账号...")
 
 # ================= 3. 初始化客户端（分配不同的设备伪装） =================
-# 预定义设备指纹列表，防止多个账号被 Telegram 识别为同一设备多开
 DEVICES = [
     {"device_model": "Samsung Galaxy S23", "system_version": "Android 13", "app_version": "10.2.1"},
     {"device_model": "iPhone 14 Pro", "system_version": "iOS 16.5", "app_version": "10.1.0"},
@@ -72,7 +71,7 @@ for i, s in enumerate(session_strings):
         )
     )
 
-# 初始化独立控制账号（使用与打手不同的设备指纹）
+# 初始化独立控制账号
 controller_client = TelegramClient(
     StringSession(CONTROLLER_SESSION),
     API_ID,
@@ -88,7 +87,6 @@ spam_tasks = []
 
 async def spam_worker(client, chat_id, content):
     """打手账号工作线程"""
-    # 获取账号标识，方便在日志里区分是哪个号在报错
     try:
         me = await client.get_me()
         client_name = me.username or str(me.id)
@@ -100,18 +98,17 @@ async def spam_worker(client, chat_id, content):
             # 尝试发送消息
             await client.send_message(chat_id, content)
             
-            # 【重要】打开成功日志，让你知道哪些号在正常工作
             logger.info(f"✅ [{client_name}] 发送成功: {content}")
             
-            # 常规间隔 300ms
-            await asyncio.sleep(0.3)
+            # 【修改点在这里】800ms 发送间隔 (0.8秒)
+            await asyncio.sleep(0.8)
             
         except FloodWaitError as e:
             # 触发慢速模式或风控限制，精准等待
             logger.warning(f"⚠️ [{client_name}] 触发慢速限制，需要等待 {e.seconds} 秒...")
             await asyncio.sleep(e.seconds)
             logger.info(f"⏱️ [{client_name}] 倒计时结束，立刻继续发送。")
-            # 注意：这里 continue 会跳过上面的 sleep(0.3)，实现倒计时一结束立刻发
+            # 这里 continue 会跳过上面的 sleep(0.8)，实现倒计时一结束立刻发
             continue
             
         except (ChatWriteForbiddenError, UserNotParticipantError) as e:
@@ -169,10 +166,9 @@ async def main():
         logger.error(f"❌ 控制账号启动失败: {e}")
         exit(1)
 
-    # 3. 只让控制账号监听指令，避免打手账号因为风控漏掉消息
+    # 3. 只让控制账号监听指令
     @controller_client.on(events.NewMessage(chats=TARGET_CHAT_ID))
     async def handler(event):
-        # 过滤：只有指定的管理员 ID 才能触发指令
         if event.sender_id != ADMIN_ID:
             return
             
